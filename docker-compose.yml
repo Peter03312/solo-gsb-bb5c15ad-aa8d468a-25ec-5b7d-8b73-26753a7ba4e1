@@ -1,0 +1,16 @@
+services:
+  museum-monitor:
+    build: .
+    container_name: museum-monitor
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      DB_PATH: /data/museum.db
+    volumes:
+      - museum-data:/data
+    restart: unless-stopped
+
+volumes:
+  museum-data:
