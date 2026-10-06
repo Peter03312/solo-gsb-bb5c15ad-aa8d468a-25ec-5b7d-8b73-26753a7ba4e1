@@ -12,9 +12,9 @@ class Response:
         self.headers = headers or {}
 
 
-def json_response(data, status=200):
+def json_response(data, status=200, headers=None):
     return Response(json.dumps(data, ensure_ascii=False, indent=2),
-                    status, "application/json; charset=utf-8")
+                    status, "application/json; charset=utf-8", headers=headers)
 
 
 def redirect(location):

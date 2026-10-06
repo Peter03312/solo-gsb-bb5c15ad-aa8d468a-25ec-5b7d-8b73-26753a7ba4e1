@@ -22,6 +22,11 @@ Docker 镜像无需安装任何包即可构建运行。
   分量成组（传递相连的成员同样纳入）。组内返回成员事件、文物、起止时间、**全组
   共有节点（可能为空）**与开放/已关闭计数；补录/更正生成新版时重算分组，旧版分组
   保持可查；关闭事件只更新所属版本的计数，不改变成员。
+- **离线采集包批量上传**：现场设备断网时暂存温湿度读数，恢复网络后以“采集包”
+  整包上传（包编号 + 采集时所见评估版本号 + 备注 + 多条读数）。服务端按基准版本做
+  一致性校验后合并，成功只生成**一个**新评估版本；版本已前进且包内
+  （文物, 时间戳）在基准版与当前版不一致时返回**冲突键与两版值**，整包不写入；
+  同包编号重试**幂等**（内容一致返回首次结果，内容不同拒绝），并发上传同样安全。
 - **输入校验**：重复时间戳、无序上下限（下限 > 上限）、非数值读数一律拒绝保存，
   并返回中文原因。
 - **页面**：首页与批次页展示批次风险摘要（开放/已关闭事件、按指标统计、缺测区间数、
@@ -79,6 +84,7 @@ python3 app.py
 | `readings`  | 读数：绑定版本、文物、节点、时间戳、温度、湿度；`corrected_from` 标记更正来源 |
 | `events`    | 风险事件：指标、起止时间、读数个数、实测范围、限值、涉及节点、最大偏离、状态与关闭结论 |
 | `gaps`      | 缺测区间：起止时间、约定间隔、实际间隔                                |
+| `upload_packages` | 离线采集包上传台账：包编号（批次内唯一）、基准版本、备注、读数指纹与存档、状态（merged/conflict）、生成版本与冻结的首次响应 |
 
 ## 业务规则
 
@@ -103,6 +109,7 @@ python3 app.py
    - 无序上下限：温度/湿度下限大于上限；
    - 非数值读数：温度/湿度无法解析为数值；
    - 其他：时间戳格式无效、文物/节点不属于该批次、采样间隔非正整数等。
+7. **离线采集包**：见下文“离线采集包批量上传（本轮新增）”专节。
 
 ## HTTP API
 
@@ -117,6 +124,9 @@ python3 app.py
 | POST | `/api/batches/<id>/nodes` | 添加运输节点 |
 | POST | `/api/batches/<id>/artifacts` | 登记文物（限值 + 采样间隔） |
 | POST | `/api/batches/<id>/readings` | 提交读数，生成新评估版本 |
+| POST | `/api/batches/<id>/packages` | **离线采集包批量上传**（包编号/基准版本/备注/读数；幂等） |
+| GET  | `/api/batches/<id>/packages` | 采集包上传记录列表 |
+| GET  | `/api/batches/<id>/packages/<包编号>` | 查询单个采集包记录（含冻结的首次响应） |
 | GET  | `/api/batches/<id>/summary` | 批次风险摘要（当前版本） |
 | GET  | `/api/batches/<id>/events?status=open&version=<n>` | 事件列表（默认当前版本） |
 | GET  | `/api/batches/<id>/versions` | 版本列表 |
@@ -243,6 +253,121 @@ curl -s "$BASE/api/batches/1/versions/2/risk-groups"
 - 批次不存在返回 `404 {"error":"批次 n 不存在"}`；版本不存在返回
   `404 {"error":"批次 n 的版本 m 不存在"}`。
 - 批次详情页展示**当前版**风险组卡片，版本快照页展示对应历史版分组。
+
+## 离线采集包批量上传（本轮新增）
+
+现场设备在网络中断期间把温湿度读数**暂存在本地**，恢复网络后以“采集包”为单位
+整批上传。采集包字段：
+
+| 字段           | 类型   | 说明                                                                 |
+| -------------- | ------ | -------------------------------------------------------------------- |
+| `package_no`   | 字符串 | **包编号**，设备侧生成，批次内唯一（最长 128 字符），用于幂等识别     |
+| `base_version` | 整数   | **采集时所见的评估版本号**；采集时尚无版本用 `0`                       |
+| `note`         | 字符串 | 备注（可空），合并成功后成为新版本备注                                |
+| `readings`     | 数组   | 多条**现有格式**读数：`artifact_id / node_id / ts / temperature / humidity` |
+
+### 合并与冲突
+
+- 基准版本就是当前版本（或当前无版本且基准为 `0`）：直接按现有规则合并，
+  成功只生成**一个**新评估版本，沿用现有校验（重复时间戳、更正）与风险评估，
+  旧版快照仍可在 `/api/batches/<id>/versions/<n>` 查询。
+- 当前版本已**前进**（其他设备/用户已提交过）：对包内**每个**
+  「文物 + 时间戳」比较其在**基准版**与**当前版**的读数（**节点、温度、湿度**
+  三者都要一致）：
+  - 全部一致（或该时间戳在两版中都尚不存在，纯属新增）→ 正常合并；
+  - 存在不一致 → 返回 **409 冲突清单**，列出冲突键及基准版值、当前版值、包内值，
+    **整包不写入、不产生版本**。
+- 冲突判定的“两版读数一致”包含 `node_id`：即使温湿度相同，节点不同也判冲突。
+
+冲突响应示例（节选）：
+
+```json
+{
+  "error": "采集包基准版本 v1 已前进到当前版本 v2，部分（文物, 时间戳）在两版间不一致，整包未写入",
+  "batch_id": 1,
+  "base_version": 1,
+  "current_version": 2,
+  "conflict_count": 1,
+  "conflicts": [
+    {
+      "key": {"artifact_id": 1, "artifact_name": "青花瓷瓶", "ts": "2026-10-01T08:00:00+00:00"},
+      "base_version": 1,
+      "base":    {"artifact_id": 1, "node_id": 1, "node_name": "库房",  "ts": "...", "temperature": 20.0, "humidity": 50.0},
+      "current_version": 2,
+      "current": {"artifact_id": 1, "node_id": 1, "node_name": "库房",  "ts": "...", "temperature": 22.0, "humidity": 50.0},
+      "package": {"artifact_id": 1, "node_id": 1, "node_name": "库房",  "ts": "...", "temperature": 26.0, "humidity": 50.0}
+    }
+  ]
+}
+```
+
+### 幂等重试与并发
+
+- 同一批次内**同包编号**重试：当基准版本、备注、读数（与提交顺序无关，按
+  文物、时间戳规范化后比较）**完全相同** → 返回**首次结果**（合并成功返回 201，
+  冲突返回 409），响应头带 `X-Idempotent-Replay: true`，不重复生成版本。
+- 同包编号但基准版本/备注/读数**任一不同** → 返回 **409** 拒绝写入，
+  响应中给出首次上传的基准版本与状态。
+- **并发上传**同样遵守：服务端对采集包上传进程内加锁，并以
+  `(batch_id, package_no)` 数据库唯一约束兜底；同一包并发只可能成功一次，
+  其余请求得到同一首次结果；不同包并发则各自独立生成版本（版本号按提交顺序递增）。
+
+### 明确报错（不产生版本、不留包记录）
+
+- 基准版本不存在 → 404 `批次 n 的版本 m 不存在`；基准为 `0` 但当前已有版本，
+  或基准版本高于当前版本 → 400；
+- 包内文物/节点**不属于该批次**（跨批次）→ 400；
+- 温度/湿度非数值、时间戳无法解析、包内同一（文物, 时间戳）重复 → 400；
+- 读数列表为空、包编号为空/超长、基准版本非非负整数 → 400。
+
+### 调用示例
+
+```bash
+BASE=http://localhost:8000
+
+# 设备离线时所见为 v2，恢复网络后整包上传（成功 → 201，生成 v3）
+curl -s -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_no": "DEV-7F3-20261001-01",
+  "base_version": 2,
+  "note": "运输途中网络中断，恢复后补传",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:10:00Z","temperature":20,"humidity":50}
+  ]}'
+
+# 同包编号重试（内容一致，顺序不同也视为相同）→ 201 + X-Idempotent-Replay: true
+curl -s -D - -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_no": "DEV-7F3-20261001-01",
+  "base_version": 2,
+  "note": "运输途中网络中断，恢复后补传",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:10:00Z","temperature":20,"humidity":50},
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50}
+  ]}'
+
+# 同编号但内容不同（如改了读数）→ 409 拒绝
+# 基准滞后且两版不一致 → 409 冲突清单（整包不写入）
+curl -s -i -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_no": "DEV-7F3-20261001-02",
+  "base_version": 3,
+  "note": "基于旧 v3 的离线包",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":28,"humidity":50}
+  ]}'
+
+# 采集时尚无版本 → base_version 用 0（仅当当前确实无版本时合法）
+curl -s -X POST $BASE/api/batches/2/packages -H 'Content-Type: application/json' -d '{
+  "package_no": "DEV-7F3-INIT", "base_version": 0, "note": "开航首批",
+  "readings": [{"artifact_id":1,"node_id":1,"ts":"2026-10-01T08:00:00Z","temperature":20,"humidity":50}]}'
+
+# 查询上传记录
+curl -s "$BASE/api/batches/1/packages"
+curl -s "$BASE/api/batches/1/packages/DEV-7F3-20261001-01"
+```
+
+成功响应在现有读数提交结果基础上额外包含 `package_no`、`base_version`、
+`package_id` 字段；状态码语义：`201` 首次合并成功，`409` 冲突或同编号内容不一致，
+带 `X-Idempotent-Replay: true` 表示本次为重放的首次结果。
 
 ## 运行测试
 

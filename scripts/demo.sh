@@ -79,3 +79,41 @@ echo
 
 echo "== 11. 旧版 v1 分组保持可查，关闭事件只更新计数（成员仍为 2 个事件）=="
 curl -s "$BASE/api/batches/1/risk-groups?version=1" | python3 -c 'import json,sys; d=json.load(sys.stdin); g=d["groups"][0]; print("v1 组:", g["group_id"], g["metric_label"], "文物数", g["artifact_count"], "事件数", g["event_count"], "共有节点", [n["name"] for n in g["common_nodes"]], "开放/关闭", g["open_events"], "/", g["closed_events"])'
+
+echo
+echo "== 12. 离线采集包：设备基于 v2 暂存，恢复网络后整包上传（当前仍 v2，合并为 v3）=="
+curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_no": "DEV-7F3-20261001-01",
+  "base_version": 2,
+  "note": "运输途中网络中断，恢复后补传",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:10:00Z","temperature":20,"humidity":50}
+  ]}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("合并结果: 包", d.get("package_no"), "基准 v%s -> 新版本 v%s, 接受 %s 条" % (d.get("base_version"), d.get("version"), d.get("accepted")))'
+
+echo "== 13. 同包编号重试（内容一致）→ 返回首次结果，不产生新版本 =="
+curl -s -D - -o /tmp/pkg_retry.json -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_no": "DEV-7F3-20261001-01",
+  "base_version": 2,
+  "note": "运输途中网络中断，恢复后补传",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:10:00Z","temperature":20,"humidity":50},
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50}
+  ]}' | grep -i 'X-Idempotent-Replay' || true
+python3 -c 'import json; d=json.load(open("/tmp/pkg_retry.json")); print("重试返回版本仍为 v%s" % d["version"])'
+
+echo "== 14. 基准版本滞后且两版不一致 → 409 冲突清单（整包不写入）=="
+# 先把 v3 的 10:00 读数更正掉（当前前进到 v4），再用基准 v3 的旧包上传
+curl -s -X POST "$BASE/api/batches/1/readings" -H "$JSON" \
+  -d '{"note":"展厅温控复核更正","readings":[{"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":19,"humidity":50}]}' >/dev/null
+curl -s -o /tmp/pkg_conflict.json -w 'HTTP %{http_code}\n' -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_no": "DEV-7F3-20261001-02",
+  "base_version": 3,
+  "note": "基于旧 v3 的离线包",
+  "readings": [
+    {"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:00:00Z","temperature":28,"humidity":50}
+  ]}'
+python3 -c 'import json; d=json.load(open("/tmp/pkg_conflict.json")); print("基准 v%s / 当前 v%s，冲突键 %d 个；示例：基准=%s 当前=%s 包内=%s" % (d["base_version"], d["current_version"], d["conflict_count"], d["conflicts"][0]["base"]["temperature"], d["conflicts"][0]["current"]["temperature"], d["conflicts"][0]["package"]["temperature"]))'
+
+echo "== 15. 查询采集包上传记录 =="
+curl -s "$BASE/api/batches/1/packages" | python3 -c 'import json,sys; [print(p["package_no"], p["status"], "-> v%s" % p["result_version"]) for p in json.load(sys.stdin)]'

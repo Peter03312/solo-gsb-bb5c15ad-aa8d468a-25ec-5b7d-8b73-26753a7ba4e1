@@ -8,7 +8,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from museum import db, pages, service
 from museum.riskgroups import find_risk_groups
@@ -191,6 +191,36 @@ def api_submit_readings(ctx):
     return json_response(result, 201)
 
 
+@router.route("POST", "/api/batches/<bid>/packages")
+def api_upload_package(ctx):
+    """离线采集包批量上传：包编号 + 基准版本号 + 备注 + 多条现有格式读数。
+
+    成功合并生成唯一一个新评估版本（201）；基准版已前进且两版不一致 → 409
+    冲突清单（整包不写入）；同编号内容一致的重试 → 返回首次结果（201/409，
+    带 X-Idempotent-Replay: true）；同编号内容不同 → 409 拒绝。
+    """
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body
+    status, result, replay = service.upload_package(
+        ctx.conn, bid, body.get("package_no"), body.get("base_version"),
+        body.get("readings"), body.get("note", ""))
+    headers = {"X-Idempotent-Replay": "true"} if replay else {}
+    return json_response(result, status, headers=headers)
+
+
+@router.route("GET", "/api/batches/<bid>/packages")
+def api_list_packages(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_packages(ctx.conn, bid))
+
+
+@router.route("GET", "/api/batches/<bid>/packages/<pno>")
+def api_get_package(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    pno = unquote(ctx.params["pno"])
+    return json_response(service.get_package_status(ctx.conn, bid, pno))
+
+
 @router.route("GET", "/api/batches/<bid>/summary")
 def api_summary(ctx):
     bid = _int(ctx.params["bid"], "批次 id")
@@ -300,6 +330,8 @@ def make_server(host, port, db_path):
                 resp = self._error(path, 400, e.message, e.details)
             except service.NotFoundError as e:
                 resp = self._error(path, 404, e.message)
+            except service.ConflictError as e:
+                resp = self._conflict(path, e)
             except Exception as e:  # noqa: BLE001
                 resp = self._error(path, 500, f"服务器内部错误: {e}")
             finally:
@@ -313,6 +345,13 @@ def make_server(host, port, db_path):
                     payload["details"] = details
                 return json_response(payload, status)
             return Response(pages.error_page(status, message), status)
+
+        def _conflict(self, path, exc):
+            if path.startswith("/api"):
+                payload = dict(exc.payload)
+                payload.setdefault("error", exc.message)
+                return json_response(payload, 409)
+            return Response(pages.error_page(409, exc.message), 409)
 
         def _send(self, resp):
             self.send_response(resp.status)

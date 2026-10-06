@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS gaps (
     actual_interval REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS upload_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    package_no TEXT NOT NULL,
+    base_version INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    readings_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_version INTEGER,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (batch_id, package_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_readings_version ON readings(version_id, artifact_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_version ON events(version_id, status);
 CREATE INDEX IF NOT EXISTS idx_gaps_version ON gaps(version_id);
@@ -86,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_gaps_version ON gaps(version_id);
 
 
 def connect(path):
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
