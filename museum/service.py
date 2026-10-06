@@ -1,6 +1,8 @@
-"""业务逻辑层：批次/节点/文物管理、读数提交与版本化评估、事件关闭、版本差异。"""
+"""业务逻辑层：批次/节点/文物管理、读数提交与版本化评估、事件关闭、版本差异、
+离线采集包合并（基准版本冲突检查 + 同编号幂等）。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -29,6 +31,15 @@ class NotFoundError(Exception):
     def __init__(self, message):
         super().__init__(message)
         self.message = message
+
+
+class ConflictError(Exception):
+    """冲突（HTTP 409）：extra 中的字段会并入错误响应 JSON。"""
+
+    def __init__(self, message, extra=None):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra or {}
 
 
 # ---------------------------------------------------------------- 工具
@@ -359,17 +370,12 @@ def add_artifact(conn, batch_id, name, temp_min, temp_max, hum_min, hum_max,
     return dict(conn.execute("SELECT * FROM artifacts WHERE id=?", (cur.lastrowid,)).fetchone())
 
 
-def submit_readings(conn, batch_id, items, note=""):
-    """提交读数（补录/更正/追加），生成新的评估版本并完成评估。
+def _validate_reading_items(conn, batch_id, items):
+    """校验并解析读数列表，返回规范化条目（含 dt/ts 与数值温度、湿度）。
 
-    校验规则：
-    - 文物、节点必须属于该批次；
-    - 时间戳必须可解析；温度/湿度必须为数值；
-    - 同一提交内（文物, 时间戳）不得重复；
-    - 与当前版本已有（文物, 时间戳）完全相同的读数视为重复时间戳，拒绝；
-      数值不同的视为更正，以新值覆盖（旧版本快照保持不变）。
+    校验规则：文物、节点必须属于该批次；时间戳必须可解析；温度/湿度必须为数值；
+    同一提交内（文物, 时间戳）不得重复。
     """
-    get_batch(conn, batch_id)
     if not isinstance(items, list) or not items:
         raise ValidationError("读数列表不能为空")
     artifacts = {a["id"]: a for a in list_artifacts(conn, batch_id)}
@@ -418,13 +424,24 @@ def submit_readings(conn, batch_id, items, note=""):
         seen[key] = i
     if errors:
         raise ValidationError("读数校验失败", errors)
+    return parsed
 
+
+def _apply_readings(conn, batch_id, parsed, note=""):
+    """把解析后的读数合并到当前版本，生成新评估版本并完成评估。
+
+    与当前版本已有（文物, 时间戳）完全相同的读数视为重复时间戳，拒绝；
+    数值不同的视为更正，以新值覆盖（旧版本快照保持不变）。
+    调用方负责事务边界；返回 (version_no, prev_no, accepted, corrected)。
+    """
+    artifacts = {a["id"]: a for a in list_artifacts(conn, batch_id)}
     prev = current_version(conn, batch_id)
     prev_map = {}
     if prev:
         for r in conn.execute("SELECT * FROM readings WHERE version_id=?", (prev["id"],)):
             prev_map[(r["artifact_id"], r["ts"])] = r
 
+    errors = []
     corrections = {}
     for i, p in enumerate(parsed):
         key = (p["artifact_id"], p["ts"])
@@ -443,45 +460,203 @@ def submit_readings(conn, batch_id, items, note=""):
         raise ValidationError("读数校验失败", errors)
 
     version_no = (prev["version_no"] if prev else 0) + 1
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO versions(batch_id, version_no, note, created_at) VALUES (?,?,?,?)",
-            (batch_id, version_no, (note or "").strip(), now_iso()),
-        )
-        version_id = cur.lastrowid
-        if prev:
-            for key, old in prev_map.items():
-                if key in corrections:
-                    continue
-                conn.execute(
-                    """INSERT INTO readings(version_id, artifact_id, node_id, ts,
-                       temperature, humidity, corrected_from) VALUES (?,?,?,?,?,?,NULL)""",
-                    (version_id, old["artifact_id"], old["node_id"], old["ts"],
-                     old["temperature"], old["humidity"]),
-                )
-        for p in parsed:
-            key = (p["artifact_id"], p["ts"])
+    cur = conn.execute(
+        "INSERT INTO versions(batch_id, version_no, note, created_at) VALUES (?,?,?,?)",
+        (batch_id, version_no, (note or "").strip(), now_iso()),
+    )
+    version_id = cur.lastrowid
+    if prev:
+        for key, old in prev_map.items():
+            if key in corrections:
+                continue
             conn.execute(
                 """INSERT INTO readings(version_id, artifact_id, node_id, ts,
-                   temperature, humidity, corrected_from) VALUES (?,?,?,?,?,?,?)""",
-                (version_id, p["artifact_id"], p["node_id"], p["ts"],
-                 p["temperature"], p["humidity"], corrections.get(key)),
+                   temperature, humidity, corrected_from) VALUES (?,?,?,?,?,?,NULL)""",
+                (version_id, old["artifact_id"], old["node_id"], old["ts"],
+                 old["temperature"], old["humidity"]),
             )
-        _evaluate_version(conn, version_id, artifacts)
+    for p in parsed:
+        key = (p["artifact_id"], p["ts"])
+        conn.execute(
+            """INSERT INTO readings(version_id, artifact_id, node_id, ts,
+               temperature, humidity, corrected_from) VALUES (?,?,?,?,?,?,?)""",
+            (version_id, p["artifact_id"], p["node_id"], p["ts"],
+             p["temperature"], p["humidity"], corrections.get(key)),
+        )
+    _evaluate_version(conn, version_id, artifacts)
+    return version_no, (prev["version_no"] if prev else None), len(parsed), len(corrections)
 
+
+def _reading_result(conn, batch_id, version_no, prev_no, accepted, corrected):
+    """组装读数提交/采集包合并的响应体（含与前一版本的差异）。"""
     detail = version_detail(conn, batch_id, version_no)
     result = {
         "batch_id": batch_id,
         "version": version_no,
-        "accepted": len(parsed),
-        "corrected": len(corrections),
+        "accepted": accepted,
+        "corrected": corrected,
         "events": detail["events"],
         "gaps": detail["gaps"],
         "readings": detail["readings"],
     }
-    if prev:
-        result["diff"] = version_diff(conn, batch_id, prev["version_no"], version_no)
+    if prev_no:
+        result["diff"] = version_diff(conn, batch_id, prev_no, version_no)
     return result
+
+
+def submit_readings(conn, batch_id, items, note=""):
+    """提交读数（补录/更正/追加），生成新的评估版本并完成评估。
+
+    校验规则见 _validate_reading_items 与 _apply_readings。
+    """
+    get_batch(conn, batch_id)
+    parsed = _validate_reading_items(conn, batch_id, items)
+    with conn:
+        version_no, prev_no, accepted, corrected = _apply_readings(
+            conn, batch_id, parsed, note)
+    return _reading_result(conn, batch_id, version_no, prev_no, accepted, corrected)
+
+
+# ---------------------------------------------------------------- 离线采集包
+
+def _reading_value_map(conn, version_id):
+    """版本读数按键 (文物, 时间戳) → {"node_id","temperature","humidity"}。"""
+    rows = conn.execute(
+        "SELECT artifact_id, ts, node_id, temperature, humidity "
+        "FROM readings WHERE version_id=?", (version_id,),
+    ).fetchall()
+    return {(r["artifact_id"], r["ts"]): {"node_id": r["node_id"],
+                                          "temperature": r["temperature"],
+                                          "humidity": r["humidity"]}
+            for r in rows}
+
+
+def _package_content_hash(base_version, note, parsed):
+    """采集包内容指纹：基准版本 + 备注 + 规范化读数（与提交顺序无关）。"""
+    norm = {
+        "base_version": base_version,
+        "note": (note or "").strip(),
+        "readings": sorted(
+            ({"artifact_id": p["artifact_id"], "node_id": p["node_id"], "ts": p["ts"],
+              "temperature": p["temperature"], "humidity": p["humidity"]}
+             for p in parsed),
+            key=lambda r: (r["artifact_id"], r["ts"], r["node_id"]),
+        ),
+    }
+    raw = json.dumps(norm, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def submit_package(conn, batch_id, package_id, base_version, note, items):
+    """离线采集包上传：校验 → 幂等检查 → 基准/当前版本冲突检查 → 合并为新版本。
+
+    规则：
+    - 包编号在批次内唯一：同编号且基准版本、备注、读数相同的重试返回首次结果
+      （不再生成新版本）；同编号但内容不同则拒绝（409）；并发上传同样遵守
+      （BEGIN IMMEDIATE 串行化 + 批次内包编号唯一约束）；
+    - base_version 为采集时所见评估版本号（尚无版本用 0），必须已存在，
+      否则报"无效基准版本"（400）；
+    - 若当前版本已前进（base_version != 当前版本号），仅当包内每个
+      (文物, 时间戳) 在基准版与当前版的读数（节点、温度、湿度）一致时才合并，
+      否则返回冲突键及两版值（409），整包不写入；
+    - 读数校验与合并沿用 submit_readings 的规则（跨批次文物/节点、非法读数、
+      重复时间戳等均拒绝）；任何失败都不产生新版本，也不占用包编号。
+    返回 (响应体, HTTP 状态码)。
+    """
+    get_batch(conn, batch_id)
+    if package_id is None or not str(package_id).strip():
+        raise ValidationError("包编号不能为空")
+    package_id = str(package_id).strip()
+    try:
+        base_version = to_int(base_version)
+        if base_version < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValidationError(
+            f"无效基准版本: {base_version!r}（须为已存在的评估版本号，尚无版本用 0）")
+    parsed = _validate_reading_items(conn, batch_id, items)
+    content_hash = _package_content_hash(base_version, note, parsed)
+
+    conn.execute("BEGIN IMMEDIATE")  # 串行化并发上传，保证同编号包只生效一次
+    try:
+        row = conn.execute(
+            "SELECT * FROM packages WHERE batch_id=? AND package_id=?",
+            (batch_id, package_id),
+        ).fetchone()
+        if row:
+            if row["content_hash"] != content_hash:
+                raise ConflictError(
+                    f"包编号 {package_id!r} 在批次 {batch_id} 已上传过，"
+                    "基准版本、备注或读数不一致，拒绝重复提交",
+                    {"package_id": package_id,
+                     "first_version": row["version_no"],
+                     "first_uploaded_at": row["created_at"]})
+            result = json.loads(row["result_json"])
+            result["deduplicated"] = True
+            conn.commit()
+            return result, 200
+
+        current = current_version(conn, batch_id)
+        current_no = current["version_no"] if current else 0
+        if base_version:
+            base = conn.execute(
+                "SELECT * FROM versions WHERE batch_id=? AND version_no=?",
+                (batch_id, base_version),
+            ).fetchone()
+            if not base:
+                raise ValidationError(
+                    f"无效基准版本：批次 {batch_id} 的版本 {base_version} 不存在")
+            base_map = _reading_value_map(conn, base["id"])
+        else:
+            base_map = {}  # 基准为"尚无版本"的空快照
+        if base_version != current_no:
+            current_map = _reading_value_map(conn, current["id"]) if current else {}
+            conflicts = []
+            for p in parsed:
+                key = (p["artifact_id"], p["ts"])
+                base_val = base_map.get(key)
+                current_val = current_map.get(key)
+                if base_val != current_val:
+                    conflicts.append({"artifact_id": key[0], "ts": key[1],
+                                      "base": base_val, "current": current_val})
+            if conflicts:
+                raise ConflictError(
+                    f"采集包与当前评估版本冲突（基准 v{base_version}，"
+                    f"当前 v{current_no}），整包未写入",
+                    {"package_id": package_id,
+                     "base_version": base_version,
+                     "current_version": current_no,
+                     "conflicts": conflicts})
+
+        version_no, prev_no, accepted, corrected = _apply_readings(
+            conn, batch_id, parsed, note)
+        result = _reading_result(conn, batch_id, version_no, prev_no,
+                                 accepted, corrected)
+        result.update({"package_id": package_id, "base_version": base_version,
+                       "deduplicated": False})
+        conn.execute(
+            """INSERT INTO packages(batch_id, package_id, base_version, note,
+               content_hash, version_no, result_json, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (batch_id, package_id, base_version, (note or "").strip(), content_hash,
+             version_no, json.dumps(result, ensure_ascii=False), now_iso()),
+        )
+        conn.commit()
+        return result, 201
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_packages(conn, batch_id):
+    """批次已成功接收的离线采集包记录（按接收顺序；校验失败/冲突的包不记录）。"""
+    get_batch(conn, batch_id)
+    rows = conn.execute(
+        """SELECT id, batch_id, package_id, base_version, note, version_no, created_at
+           FROM packages WHERE batch_id=? ORDER BY id""",
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def _evaluate_version(conn, version_id, artifacts):

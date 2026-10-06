@@ -191,6 +191,24 @@ def api_submit_readings(ctx):
     return json_response(result, 201)
 
 
+@router.route("POST", "/api/batches/<bid>/packages")
+def api_submit_package(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body
+    if not isinstance(body, dict):
+        raise service.ValidationError("请求体必须是 JSON 对象")
+    result, status = service.submit_package(
+        ctx.conn, bid, body.get("package_id"), body.get("base_version"),
+        body.get("note", ""), body.get("readings"))
+    return json_response(result, status)
+
+
+@router.route("GET", "/api/batches/<bid>/packages")
+def api_list_packages(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_packages(ctx.conn, bid))
+
+
 @router.route("GET", "/api/batches/<bid>/summary")
 def api_summary(ctx):
     bid = _int(ctx.params["bid"], "批次 id")
@@ -300,17 +318,21 @@ def make_server(host, port, db_path):
                 resp = self._error(path, 400, e.message, e.details)
             except service.NotFoundError as e:
                 resp = self._error(path, 404, e.message)
+            except service.ConflictError as e:
+                resp = self._error(path, 409, e.message, extra=e.extra)
             except Exception as e:  # noqa: BLE001
                 resp = self._error(path, 500, f"服务器内部错误: {e}")
             finally:
                 conn.close()
             self._send(resp)
 
-        def _error(self, path, status, message, details=None):
+        def _error(self, path, status, message, details=None, extra=None):
             if path.startswith("/api"):
                 payload = {"error": message}
                 if details:
                     payload["details"] = details
+                if extra:
+                    payload.update(extra)
                 return json_response(payload, status)
             return Response(pages.error_page(status, message), status)
 

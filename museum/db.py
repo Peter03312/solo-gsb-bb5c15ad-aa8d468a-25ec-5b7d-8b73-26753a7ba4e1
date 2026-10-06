@@ -79,9 +79,23 @@ CREATE TABLE IF NOT EXISTS gaps (
     actual_interval REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    package_id TEXT NOT NULL,
+    base_version INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    version_no INTEGER NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (batch_id, package_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_readings_version ON readings(version_id, artifact_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_version ON events(version_id, status);
 CREATE INDEX IF NOT EXISTS idx_gaps_version ON gaps(version_id);
+CREATE INDEX IF NOT EXISTS idx_packages_batch ON packages(batch_id);
 """
 
 

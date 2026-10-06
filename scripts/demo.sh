@@ -79,3 +79,44 @@ echo
 
 echo "== 11. 旧版 v1 分组保持可查，关闭事件只更新计数（成员仍为 2 个事件）=="
 curl -s "$BASE/api/batches/1/risk-groups?version=1" | python3 -c 'import json,sys; d=json.load(sys.stdin); g=d["groups"][0]; print("v1 组:", g["group_id"], g["metric_label"], "文物数", g["artifact_count"], "事件数", g["event_count"], "共有节点", [n["name"] for n in g["common_nodes"]], "开放/关闭", g["open_events"], "/", g["closed_events"])'
+
+echo "== 12. 离线采集包：基准 v2（即当前版）上传 → 合并为 v3 =="
+curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_id": "PKG-2026-0001",
+  "base_version": 2,
+  "note": "运输车离线采集回补",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:10:00Z","temperature":26,"humidity":50}
+  ]}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("合并成功: 版本 v%d, 包 %s, 基准 v%d, 事件 %d 个" % (d["version"], d["package_id"], d["base_version"], len(d["events"])))'
+
+echo "== 13. 相同内容重试 → 返回首次结果（deduplicated），不生成新版本 =="
+curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_id": "PKG-2026-0001",
+  "base_version": 2,
+  "note": "运输车离线采集回补",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:10:00Z","temperature":26,"humidity":50}
+  ]}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("重试: 版本 v%d, deduplicated=%s" % (d["version"], d["deduplicated"]))'
+
+echo "== 14. 同编号不同内容 → 拒绝（409）=="
+curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_id": "PKG-2026-0001",
+  "base_version": 2,
+  "note": "改动过的内容",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T11:00:00Z","temperature":21,"humidity":50}
+  ]}'
+
+echo "== 15. 过期基准冲突：base_version=1，而 08:20 读数已在 v2 被更正（27→22）→ 409 整包不写入 =="
+curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
+  "package_id": "PKG-2026-0002",
+  "base_version": 1,
+  "note": "基准过期的包",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T08:20:00Z","temperature":23,"humidity":50}
+  ]}'
+
+echo "== 16. 已成功接收的采集包列表（冲突/校验失败的包不占用编号）=="
+curl -s "$BASE/api/batches/1/packages"

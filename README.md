@@ -22,6 +22,11 @@ Docker 镜像无需安装任何包即可构建运行。
   分量成组（传递相连的成员同样纳入）。组内返回成员事件、文物、起止时间、**全组
   共有节点（可能为空）**与开放/已关闭计数；补录/更正生成新版时重算分组，旧版分组
   保持可查；关闭事件只更新所属版本的计数，不改变成员。
+- **离线采集包**：现场设备离线暂存温湿度读数，恢复网络后按包上传。包携带**包编号、
+  采集时所见评估版本号（基准版本，尚无版本用 0）、备注**与现有多条读数；当前版本
+  已前进时逐键比对基准版与当前版，全部一致才合并为一个新版本，冲突则整包不写入
+  并返回冲突键及两版值；**同编号包重试幂等**（相同内容返回首次结果，不同内容拒绝），
+  并发上传同样遵守。
 - **输入校验**：重复时间戳、无序上下限（下限 > 上限）、非数值读数一律拒绝保存，
   并返回中文原因。
 - **页面**：首页与批次页展示批次风险摘要（开放/已关闭事件、按指标统计、缺测区间数、
@@ -79,6 +84,7 @@ python3 app.py
 | `readings`  | 读数：绑定版本、文物、节点、时间戳、温度、湿度；`corrected_from` 标记更正来源 |
 | `events`    | 风险事件：指标、起止时间、读数个数、实测范围、限值、涉及节点、最大偏离、状态与关闭结论 |
 | `gaps`      | 缺测区间：起止时间、约定间隔、实际间隔                                |
+| `packages`  | 已接收的离线采集包：包编号（批次内唯一）、基准版本、内容指纹、生成的版本号与首次结果 |
 
 ## 业务规则
 
@@ -103,6 +109,14 @@ python3 app.py
    - 无序上下限：温度/湿度下限大于上限；
    - 非数值读数：温度/湿度无法解析为数值；
    - 其他：时间戳格式无效、文物/节点不属于该批次、采样间隔非正整数等。
+7. **离线采集包**（详见下文「离线采集包上传」）：
+   - 合并条件：当前版本已前进时，包内每个「文物+时间戳」在基准版与当前版的
+     读数（节点、温度、湿度）必须一致，否则整包不写入并返回 409 与冲突明细；
+   - 成功合并只生成一个新评估版本，校验与风险评估规则与在线提交完全一致；
+   - 幂等：同批次同编号且基准版本、备注、读数相同的重试返回首次结果
+     （不产生新版本）；同编号内容不同拒绝（409）；并发上传遵守同一约束；
+   - 无效基准版本、跨批次文物/节点、非法读数均明确报错（400），
+     不产生版本也不占用包编号。
 
 ## HTTP API
 
@@ -117,6 +131,8 @@ python3 app.py
 | POST | `/api/batches/<id>/nodes` | 添加运输节点 |
 | POST | `/api/batches/<id>/artifacts` | 登记文物（限值 + 采样间隔） |
 | POST | `/api/batches/<id>/readings` | 提交读数，生成新评估版本 |
+| POST | `/api/batches/<id>/packages` | 上传离线采集包（冲突检查 + 幂等合并，见下文） |
+| GET  | `/api/batches/<id>/packages` | 已成功接收的采集包列表 |
 | GET  | `/api/batches/<id>/summary` | 批次风险摘要（当前版本） |
 | GET  | `/api/batches/<id>/events?status=open&version=<n>` | 事件列表（默认当前版本） |
 | GET  | `/api/batches/<id>/versions` | 版本列表 |
@@ -243,6 +259,102 @@ curl -s "$BASE/api/batches/1/versions/2/risk-groups"
 - 批次不存在返回 `404 {"error":"批次 n 不存在"}`；版本不存在返回
   `404 {"error":"批次 n 的版本 m 不存在"}`。
 - 批次详情页展示**当前版**风险组卡片，版本快照页展示对应历史版分组。
+
+### 离线采集包上传（本轮新增）
+
+现场设备离线时暂存温湿度读数，恢复网络后按**采集包**上传：
+`POST /api/batches/<id>/packages`。
+
+请求体（`readings` 与在线提交格式相同）：
+
+```json
+{
+  "package_id": "PKG-2026-0001",
+  "base_version": 1,
+  "note": "运输车离线采集回补",
+  "readings": [
+    {"artifact_id": 1, "node_id": 2, "ts": "2026-10-01T10:00:00Z", "temperature": 21, "humidity": 50}
+  ]
+}
+```
+
+- `package_id`：包编号，**批次内唯一**，用于幂等去重；
+- `base_version`：采集时设备所见的评估版本号，**尚无版本用 0**；
+- `note`：备注，作为新版本的备注保存；
+- `readings`：多条读数，格式与 `POST /api/batches/<id>/readings` 相同。
+
+**合并规则**：
+
+1. 当前版本号等于 `base_version`：直接合并。
+2. 当前版本已前进（`base_version` 小于当前版本号）：仅当包内每个
+   「文物+时间戳」在**基准版**与**当前版**的读数（节点、温度、湿度）完全一致
+   才合并；任一不一致即返回 `409` 与冲突明细（冲突键及两版值，缺失一侧为
+   `null`），**整包不写入**：
+   ```json
+   {
+     "error": "采集包与当前评估版本冲突（基准 v1，当前 v3），整包未写入",
+     "package_id": "PKG-2026-0001",
+     "base_version": 1,
+     "current_version": 3,
+     "conflicts": [
+       {"artifact_id": 1, "ts": "2026-10-01T08:20:00+00:00",
+        "base": {"node_id": 2, "temperature": 27.0, "humidity": 50.0},
+        "current": {"node_id": 2, "temperature": 22.0, "humidity": 50.0}}
+     ]
+   }
+   ```
+3. 成功合并**只生成一个新评估版本**（`201`），校验（跨批次文物/节点、非法
+   读数、重复时间戳等）与风险评估（事件合并、缺测中断、共因风险组）规则与
+   在线提交完全一致；旧版快照照常可查。
+4. **幂等**：同批次同编号且基准版本、备注、读数相同的重试返回**首次结果**
+   （`200`，`"deduplicated": true`，不再生成新版本）；同编号但内容不同返回
+   `409`；并发上传遵守同一约束（事务串行化 + 批次内包编号唯一约束）。
+   内容比较按语义规范化：读数顺序、`20` 与 `20.0`、`Z` 与 `+00:00`
+   等写法差异不影响「相同」判定。
+5. **报错**（均不产生版本、不占用包编号，修正后可用同编号重传）：
+   无效基准版本（不存在/负数/非整数/缺失）、跨批次文物或节点、非法读数
+   返回 `400` 与中文原因；批次不存在返回 `404`。
+
+**调用示例**：
+
+```bash
+BASE=http://localhost:8000
+
+# 1. 设备在版本 v1 时离线采集，恢复后上传（当前仍是 v1 → 直接合并为 v2）
+curl -s -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_id": "PKG-2026-0001",
+  "base_version": 1,
+  "note": "运输车离线采集回补",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:10:00Z","temperature":26,"humidity":50}
+  ]}'
+
+# 2. 网络重试：相同内容原样重发 → 200 返回首次结果，不生成新版本
+curl -s -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_id": "PKG-2026-0001",
+  "base_version": 1,
+  "note": "运输车离线采集回补",
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:00:00Z","temperature":21,"humidity":50},
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T10:10:00Z","temperature":26,"humidity":50}
+  ]}'
+
+# 3. 查看已成功接收的采集包
+curl -s $BASE/api/batches/1/packages
+
+# 4. 若期间在线更正过读数（当前已到 v3），基准 v1 的包且包内键被改动 → 409 冲突明细
+curl -s -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json' -d '{
+  "package_id": "PKG-2026-0002",
+  "base_version": 1,
+  "readings": [
+    {"artifact_id":1,"node_id":2,"ts":"2026-10-01T08:20:00Z","temperature":23,"humidity":50}
+  ]}'
+```
+
+响应（首次合并成功，`201`）在在线提交响应的基础上增加
+`package_id`、`base_version`、`deduplicated` 字段；`GET /api/batches/<id>/packages`
+返回已接收包的 `package_id`、`base_version`、`note`、生成的 `version_no` 与接收时间。
 
 ## 运行测试
 

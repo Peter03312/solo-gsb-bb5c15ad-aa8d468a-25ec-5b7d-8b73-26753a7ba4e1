@@ -492,5 +492,331 @@ class RiskGroupApiTest(unittest.TestCase):
             self.assertIn("跨文物共因风险组", html)
 
 
+class PackageApiTest(unittest.TestCase):
+    """离线采集包上传：合并、冲突检查、幂等、并发、校验。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.tmp = tempfile.TemporaryDirectory()
+        db_path = os.path.join(cls.tmp.name, "test-pkg.db")
+        cls.server = app.make_server("127.0.0.1", 0, db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def req(self, method, path, payload=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        if data:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                return resp.status, json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def _setup_batch(self):
+        """建批次 + 节点(库房/运输车) + 一件文物，返回 (bid, aid, n1, n2)。"""
+        st, batch = self.req("POST", "/api/batches", {"name": "离线采集包测试"})
+        self.assertEqual(st, 201)
+        bid = batch["id"]
+        for seq, name in [(1, "库房"), (2, "运输车")]:
+            st, _ = self.req("POST", f"/api/batches/{bid}/nodes",
+                             {"seq": seq, "name": name})
+            self.assertEqual(st, 201)
+        st, art = self.req("POST", f"/api/batches/{bid}/artifacts",
+                           {"name": "青花瓷瓶", "temp_min": 18, "temp_max": 24,
+                            "hum_min": 45, "hum_max": 60, "sample_interval": 600})
+        self.assertEqual(st, 201)
+        _, det = self.req("GET", f"/api/batches/{bid}")
+        n1, n2 = [n["id"] for n in det["nodes"]]
+        return bid, art["id"], n1, n2
+
+    @staticmethod
+    def _r(aid, node, ts, t, h=50):
+        return {"artifact_id": aid, "node_id": node, "ts": ts,
+                "temperature": t, "humidity": h}
+
+    def _version_count(self, bid):
+        _, versions = self.req("GET", f"/api/batches/{bid}/versions")
+        return len(versions)
+
+    def test_basic_merge_and_idempotent_retry(self):
+        bid, aid, n1, n2 = self._setup_batch()
+        pkg = {
+            "package_id": "PKG-0001",
+            "base_version": 0,  # 采集时尚无版本
+            "note": "运输车离线采集回补",
+            "readings": [
+                self._r(aid, n1, "2026-10-01T08:00:00Z", 20),
+                self._r(aid, n2, "2026-10-01T08:10:00Z", 26),  # 温度越界
+                self._r(aid, n2, "2026-10-01T08:20:00Z", 21),
+            ],
+        }
+        st, res = self.req("POST", f"/api/batches/{bid}/packages", pkg)
+        self.assertEqual(st, 201)
+        self.assertEqual(res["version"], 1)
+        self.assertEqual(res["accepted"], 3)
+        self.assertEqual(res["package_id"], "PKG-0001")
+        self.assertEqual(res["base_version"], 0)
+        self.assertFalse(res["deduplicated"])
+        self.assertEqual(len([e for e in res["events"]
+                              if e["metric"] == "temperature"]), 1)
+
+        # 相同内容重试 → 返回首次结果，不产生新版本
+        st, res2 = self.req("POST", f"/api/batches/{bid}/packages", pkg)
+        self.assertEqual(st, 200)
+        self.assertTrue(res2["deduplicated"])
+        self.assertEqual(res2["version"], 1)
+        self.assertEqual(res2["readings"], res["readings"])
+        self.assertEqual(self._version_count(bid), 1)
+
+        # 语义相同（读数顺序不同、时间戳写法不同、数值写法不同）也视为同一包
+        pkg_equiv = dict(pkg, readings=[
+            dict(self._r(aid, n2, "2026-10-01T08:20:00+00:00", 21.0, 50.0)),
+            self._r(aid, n2, "2026-10-01T08:10:00Z", 26),
+            self._r(aid, n1, "2026-10-01T08:00:00Z", 20),
+        ])
+        st, res3 = self.req("POST", f"/api/batches/{bid}/packages", pkg_equiv)
+        self.assertEqual(st, 200)
+        self.assertTrue(res3["deduplicated"])
+        self.assertEqual(self._version_count(bid), 1)
+
+        # 同编号但内容不同（读数不同 / 备注不同 / 基准版本不同）→ 拒绝
+        for altered in (
+            dict(pkg, readings=[self._r(aid, n1, "2026-10-01T09:00:00Z", 20)]),
+            dict(pkg, note="改动过的备注"),
+            dict(pkg, base_version=1),
+        ):
+            st, err = self.req("POST", f"/api/batches/{bid}/packages", altered)
+            self.assertEqual(st, 409)
+            self.assertIn("拒绝重复提交", err["error"])
+        self.assertEqual(self._version_count(bid), 1)
+
+        # 第二包：基准 v1（即当前版），正常合并 → 只生成一个新版本 v2
+        pkg2 = {
+            "package_id": "PKG-0002",
+            "base_version": 1,
+            "note": "第二批",
+            "readings": [self._r(aid, n2, "2026-10-01T08:30:00Z", 27)],
+        }
+        st, res4 = self.req("POST", f"/api/batches/{bid}/packages", pkg2)
+        self.assertEqual(st, 201)
+        self.assertEqual(res4["version"], 2)
+        self.assertEqual(self._version_count(bid), 2)
+
+        # 旧版快照可查
+        st, v1 = self.req("GET", f"/api/batches/{bid}/versions/1")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(v1["readings"]), 3)
+
+        # 已接收包列表
+        st, packages = self.req("GET", f"/api/batches/{bid}/packages")
+        self.assertEqual(st, 200)
+        self.assertEqual([(p["package_id"], p["base_version"], p["version_no"])
+                          for p in packages],
+                         [("PKG-0001", 0, 1), ("PKG-0002", 1, 2)])
+
+    def test_conflict_check_against_advanced_version(self):
+        bid, aid, n1, n2 = self._setup_batch()
+        # v1：两条读数
+        st, res = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(aid, n1, "2026-10-01T08:00:00Z", 26),
+            self._r(aid, n1, "2026-10-01T08:10:00Z", 20),
+        ]})
+        self.assertEqual(st, 201)
+        # v2：更正 08:00 的温度 26 → 22
+        st, res = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(aid, n2, "2026-10-01T08:00:00Z", 22),
+        ]})
+        self.assertEqual(st, 201)
+        self.assertEqual(res["version"], 2)
+
+        # 包内键 (aid, 08:00) 在基准 v1（节点n1/26℃）与当前 v2（节点n2/22℃）不一致
+        # → 409，返回冲突键及两版值，整包不写入、不占用包编号
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C1",
+            "base_version": 1,
+            "note": "过期基准的包",
+            "readings": [
+                self._r(aid, n1, "2026-10-01T08:00:00Z", 25),
+                self._r(aid, n1, "2026-10-01T08:10:00Z", 20),
+            ],
+        })
+        self.assertEqual(st, 409)
+        self.assertIn("整包未写入", err["error"])
+        self.assertEqual(err["base_version"], 1)
+        self.assertEqual(err["current_version"], 2)
+        conflicts = {(c["artifact_id"], c["ts"]): c for c in err["conflicts"]}
+        self.assertEqual(set(conflicts), {(aid, "2026-10-01T08:00:00+00:00")})
+        c = conflicts[(aid, "2026-10-01T08:00:00+00:00")]
+        self.assertEqual(c["base"], {"node_id": n1, "temperature": 26, "humidity": 50})
+        self.assertEqual(c["current"], {"node_id": n2, "temperature": 22, "humidity": 50})
+        self.assertEqual(self._version_count(bid), 2)
+        st, packages = self.req("GET", f"/api/batches/{bid}/packages")
+        self.assertEqual(packages, [])  # 冲突包不记录，修正后可用同编号重传
+
+        # 基准 v0（尚无版本）但当前版已存在该键 → 同样冲突（base 侧为 null）
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C2",
+            "base_version": 0,
+            "readings": [self._r(aid, n1, "2026-10-01T08:10:00Z", 20)],
+        })
+        self.assertEqual(st, 409)
+        self.assertIsNone(err["conflicts"][0]["base"])
+        self.assertEqual(err["conflicts"][0]["current"]["temperature"], 20)
+
+        # 包内键在两版间一致（08:10 未被改动）+ 新键 → 合并成功，只生成一个版本
+        st, res = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C1",  # 冲突未占用编号，可复用
+            "base_version": 1,
+            "note": "修正后的包",
+            "readings": [
+                self._r(aid, n1, "2026-10-01T08:10:00Z", 21),  # 更正两版一致的键
+                self._r(aid, n2, "2026-10-01T08:20:00Z", 23),  # 新键
+            ],
+        })
+        self.assertEqual(st, 201)
+        self.assertEqual(res["version"], 3)
+        self.assertEqual(res["corrected"], 1)
+        self.assertEqual(self._version_count(bid), 3)
+
+        # 基准等于当前版：不做冲突检查，沿用现有校验（相同读数 → 重复时间戳）
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C3",
+            "base_version": 3,
+            "readings": [self._r(aid, n1, "2026-10-01T08:10:00Z", 21)],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("重复时间戳", json.dumps(err, ensure_ascii=False))
+        self.assertEqual(self._version_count(bid), 3)
+
+    def test_invalid_base_version_and_payload(self):
+        bid, aid, n1, n2 = self._setup_batch()
+        st, res = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-V1", "base_version": 0,
+            "readings": [self._r(aid, n1, "2026-10-01T08:00:00Z", 20)],
+        })
+        self.assertEqual(st, 201)
+
+        reading = self._r(aid, n1, "2026-10-01T09:00:00Z", 20)
+        # 无效基准版本：不存在 / 负数 / 非整数 / 缺失
+        for bad_base in (99, -1, "abc", None, 1.5):
+            st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+                "package_id": f"PKG-BAD-{bad_base}",
+                "base_version": bad_base,
+                "readings": [reading],
+            })
+            self.assertEqual(st, 400, bad_base)
+            self.assertIn("无效基准版本", err["error"])
+        # 缺包编号 / 空包编号
+        for bad_pid in (None, "", "   "):
+            st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+                "package_id": bad_pid, "base_version": 1, "readings": [reading],
+            })
+            self.assertEqual(st, 400)
+            self.assertIn("包编号不能为空", err["error"])
+        # 跨批次文物 / 节点
+        bid2, aid2, _, _ = self._setup_batch()
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X1", "base_version": 1,
+            "readings": [self._r(aid2, n1, "2026-10-01T09:00:00Z", 20)],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("不属于批次", json.dumps(err, ensure_ascii=False))
+        _, det2 = self.req("GET", f"/api/batches/{bid2}")
+        other_node = det2["nodes"][0]["id"]
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X2", "base_version": 1,
+            "readings": [self._r(aid, other_node, "2026-10-01T09:00:00Z", 20)],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("不属于批次", json.dumps(err, ensure_ascii=False))
+        # 非法读数：非数值 / 非法时间戳 / 空列表 / 提交内重复
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X3", "base_version": 1,
+            "readings": [self._r(aid, n1, "2026-10-01T09:00:00Z", "偏高")],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("非数值", json.dumps(err, ensure_ascii=False))
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X4", "base_version": 1,
+            "readings": [self._r(aid, n1, "不是时间", 20)],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("时间戳格式无效", json.dumps(err, ensure_ascii=False))
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X5", "base_version": 1, "readings": [],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("读数列表不能为空", err["error"])
+        st, err = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-X6", "base_version": 1,
+            "readings": [reading, dict(reading, temperature=21)],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("重复时间戳", json.dumps(err, ensure_ascii=False))
+
+        # 以上全部不产生新版本、不记录包
+        self.assertEqual(self._version_count(bid), 1)
+        st, packages = self.req("GET", f"/api/batches/{bid}/packages")
+        self.assertEqual([p["package_id"] for p in packages], ["PKG-V1"])
+        # 批次不存在 → 404
+        st, err = self.req("POST", "/api/batches/9999/packages", {
+            "package_id": "PKG-X", "base_version": 0, "readings": [reading],
+        })
+        self.assertEqual(st, 404)
+
+    def test_concurrent_uploads(self):
+        bid, aid, n1, n2 = self._setup_batch()
+        pkg = {
+            "package_id": "PKG-CONC",
+            "base_version": 0,
+            "note": "并发重试",
+            "readings": [self._r(aid, n1, "2026-10-01T08:00:00Z", 20)],
+        }
+
+        def upload(payload, results):
+            results.append(self.req("POST", f"/api/batches/{bid}/packages", payload))
+
+        # 并发上传同编号同内容 → 恰好一次 201，其余 200，只生成一个版本
+        results = []
+        threads = [threading.Thread(target=upload, args=(pkg, results))
+                   for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        statuses = sorted(s for s, _ in results)
+        self.assertEqual(statuses, [200, 200, 200, 200, 200, 201])
+        self.assertTrue(all(r["version"] == 1 for _, r in results))
+        self.assertEqual(self._version_count(bid), 1)
+
+        # 并发上传同编号不同内容 → 恰好一个 201，其余 409，仍只生成一个版本
+        results2 = []
+        threads = [
+            threading.Thread(target=upload, args=(
+                {"package_id": "PKG-CONC2", "base_version": 1, "note": f"内容{i}",
+                 "readings": [self._r(aid, n1, "2026-10-01T09:00:00Z", 21)]},
+                results2))
+            for i in range(5)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        statuses2 = sorted(s for s, _ in results2)
+        self.assertEqual(statuses2, [201, 409, 409, 409, 409])
+        self.assertEqual(self._version_count(bid), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
